@@ -1,0 +1,417 @@
+#!/bin/sh
+#
+#
+#+-----------------------------------------------------------------------------+
+#|                                                                             |
+#| Copyright 2021 higherkinded                                                 |
+#|                                                                             |
+#| Redistribution and use in source and binary forms, with or without          |
+#| modification, are permitted provided that the following conditions are met: |
+#|                                                                             |
+#| 1. Redistributions of source code must retain the above copyright notice,   |
+#|    this list of conditions and the following disclaimer.                    |
+#|                                                                             |
+#| 2. Redistributions in binary form must reproduce the above copyright        |
+#|    notice, this list of conditions and the following disclaimer in the      |
+#|    documentation and/or other materials provided with the distribution.     |
+#|                                                                             |
+#| 3. Neither the name of the copyright holder nor the names of its            |
+#|    contributors may be used to endorse or promote products derived from     |
+#|    this software without specific prior written permission.                 |
+#|                                                                             |
+#| THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" |
+#| AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE   |
+#| IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE  |
+#| ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE   |
+#| LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR         |
+#| CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF        |
+#| SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS    |
+#| INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN     |
+#| CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)     |
+#| ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE  |
+#| POSSIBILITY OF SUCH DAMAGE.                                                 |
+#|                                                                             |
+#+-----------------------------------------------------------------------------+
+#
+# Basically, be aware that I'm not responsible for any sudden loss of passwords.
+# Keep backups and practice good opsec. You've been warned.
+#
+
+(
+    __ARGUMENTS=($@)
+
+
+    __GPG_PROG=
+    __GPG_PROG_CANDIDATES=(gpg2 gpg)
+    __TEMP_SUBDIR="passball-$USER/$$"
+    __TEMP_DIR="/tmp/$__TEMP_SUBDIR"
+
+    _password_names=()
+
+    panic() {
+        printf "\e[31m!\e[0m $2\n"
+        for msg in ${@:3}; do
+            printf "  \e[31mx\e[0m $msg\n"
+        done
+        exit $1
+    }
+
+    terminate() {
+        printf "\e[32mDONE!\e[0m $@\n"
+        exit 0
+    }
+
+    phase() {
+        printf "\e[1m:\e[0m $@\n"
+    }
+
+    subaction() {
+        printf "  \e[32m*\e[0m $@\n"
+    }
+
+    suberror() {
+        printf "  \e[31mx\e[0m $@\n"
+    }
+
+    check_prog() {
+        which $1 2>&- 1>&- || panic 127 "Can't find '$1'."
+    }
+
+    done_pws_message() {
+        action="$1"
+        amount="$2"
+        case $amount in
+            0)  msg="No passwords processed." ;;
+            1)  msg="${1}ed $amount password." ;;
+            *)
+                if [ ${amount: -2} -eq "11" ]; then
+                    msg="${1}ed $amount passwords."
+                else if [ ${amount: -1 } -eq "1" ]; then
+                    msg="${1}ed $amount password."
+                else msg="${1}ed $amount passwords."; fi; fi
+        esac
+        printf "$msg"
+    }
+
+    detect_gpg() {
+        for candidate in ${__GPG_PROG_CANDIDATES[*]}; do
+            if which $candidate 2>&- 1>&-; then
+                __GPG_PROG=$candidate
+                break
+            fi
+        done
+        [ -z "$__GPG_PROG" ] && panic 127 \
+            "Cannot find GPG program to use. Attempted candidates:" \
+            ${__GPG_PROG_CANDIDATES[*]}
+    }
+
+    dependencies() {
+        check_prog "cut"
+        check_prog "pass"
+        check_prog "printf"
+        check_prog "tail"
+        check_prog "tar"
+        detect_gpg
+    }
+
+    get_passwords() {
+        if [ ! -z "${_password_names[*]}" ]; then
+            subaction "Passwords were provided by caller"
+        else
+            subaction "Checking for passwords"
+            IFS=$'\n' read -r -d '' -a _password_names \
+                < <(pass 2>&- | grep '─' | cut -d\  -f2-)
+
+            for i in $(seq 0 $(( ${#_password_names[*]} -1 ))); do
+                _password_names[$i]="$(
+                    sed -e 's/\\ / /g' <<< "${_password_names[$i]}")"
+            done
+
+            unset IFS
+
+            [ "$1" == "terminate" ] && [ -z "$_password_names" ] && \
+                terminate "No passwords, nothing to do."
+        fi
+    }
+
+    usage() {
+        printf "Usage:\n"
+        printf "  \e[1m$0\e[0m [-h|--help] [ACTION] [RECIPIENT_ID [...]]\n\n"
+        printf "Actions:\n"
+        printf "  \e[1mimport\e[0m - Import passwords from a tarball into a store.\n"
+        printf "  \e[1mexport\e[0m - Create a password tarball.\n\n"
+    }
+
+    export_usage() {
+        printf "Export flow:\n"
+        printf "  \e[1m$0\e[0m export [-h|--help] RECIPIENT_ID [PASSWORDS...]\n\n"
+        printf "  \e[1m--help\e[0m       - Display this message\n"
+        printf "  \e[1mRECIPIENT_ID\e[0m - Recipient's identity\n"
+        printf "  \e[1mPASSWORDS\e[0m    - Passwords to export "
+        printf                  "Export all if not specified\n\n"
+    }
+
+    import_usage() {
+        printf "Import flow:\n"
+        printf "  \e[1m$0\e[0m import [-h|--help] FILE\n\n"
+        printf "  \e[1m--help\e[0m       - Display this message\n"
+        printf "  \e[1mFILE\e[0m         - *.ept file to import from\n\n"
+    }
+
+    check_recipient_pubk() {
+        subaction "Checking for recipient's public key"
+        $__GPG_PROG --list-keys $1 2>&- 1>&- \
+            || panic 2 "Recipient public key '$1' wasn't found."
+    }
+
+    confirm() {
+        printf "  \e[33m?\e[0m $1 [Y/N]: "
+        read _confirmation
+        while true
+        do
+            case ${_confirmation:0:1} in
+                Y|y) return 0 ;;
+                N|n) return 1 ;;
+            esac
+            printf "[Y]es or [N]o only, please: "
+            read _confirmation
+        done
+    }
+
+    create_temp_dir() {
+        subaction "Creating tmpdir"
+        [ ! -z "$XDG_RUNTIME_DIR" ] && \
+            __TEMP_DIR="$XDG_RUNTIME_DIR/$__TEMP_SUBDIR"
+        mkdir -p "$__TEMP_DIR" 2>&- \
+            && chmod 0700 "$__TEMP_DIR" 2>&- \
+            || panic 1 "Cannot create a temp dir at '$__TEMP_DIR'."
+    }
+
+    clean_temp_dir() {
+        phase "Cleaning up"
+        rm -r "$__TEMP_DIR" || panic 1 "Cannot remove a temp dir."
+    }
+
+    reencrypt_with() {
+        reencrypt_failed=false
+        password=$(pass "$1" 2>&-) || {
+            suberror "Can't retrieve '$1' from password store."
+            reencrypt_failed=true
+        }
+        $reencrypt_failed && return 1
+
+        (printf "%s" "$password" \
+            | $__GPG_PROG --encrypt -r "$2" --armor > "$3" \
+        ) || {
+            suberror "Failed to encrypt '$1'."
+            reencrypt_failed=true
+        }
+        $reencrypt_failed && return 1
+
+        chmod 0600 "$3" || {
+            suberror "Failed to change permissions on '$3'"
+            reencrypt_failed=true
+        }
+        $reencrypt_failed && return 1
+
+        subaction "Reencrypted '$1'"
+    }
+
+    create_tarball() {
+        phase "Creating a tarball"
+
+        tarball_file="$rec_id.ept"
+        tar cpf - ${files[*]} -C "$__TEMP_DIR" \
+        | $__GPG_PROG --encrypt -r "$rec_id" > "$tarball_file" || {
+            suberror "Failed to create the password tarball."
+            cleanup $_password_names
+            panic 1 "Couldn't proceed due to errors."
+        }
+
+        subaction "Created the password tarball."
+    }
+
+    wipe_file() {
+        file="$__TEMP_DIR/$1"
+        stat "$file" 2>&- 1>&- || return 1
+        length=$(wc -c "$file" | cut -d\  -f1)
+        wipe_failed=false
+        printf "A%.0s" $(seq 1 $length) 2>&- > "$file" || wipe_failed=true
+        rm "$file" || wipe_failed=true
+        if $wipe_failed; then
+            suberror  "Failed to wipe '$1'.";
+        else
+            subaction "Wiped tempfile for '$1'."
+        fi
+    }
+
+    cleanup() {
+        phase "Cleaning up"
+        passwords=$1
+        for password in ${files[*]}; do
+            wipe_file "$password"
+        done
+        rm -r "$__TEMP_DIR"
+    }
+
+    do_export() {
+        rec_id=${__ARGUMENTS[1]}
+        case $rec_id in
+            "" | "-h" | "--help")
+                export_usage
+                terminate "Help requested, nothing to do."
+                break ;;
+        esac
+
+        if [[ ! -z ${__ARGUMENTS[*]:2} ]]; then
+            _password_names=(${__ARGUMENTS[*]:2})
+        fi
+
+        phase "Preparing"
+        get_passwords terminate
+        check_recipient_pubk "$rec_id"
+        create_temp_dir
+
+        phase "Reencrypting"
+
+        failed=false
+
+        # Reencrypt for recipient
+        files=()
+        IFS=$'\n'
+        for i in $(seq 0 $(( ${#_password_names[*]} - 1 ))); do
+            password=${_password_names[$i]}
+            filename="$__TEMP_DIR/$password.gpg"
+            (reencrypt_with $password $rec_id "$filename") || nopw=false
+            if $nopw; then
+                files[$i]="$password.gpg"
+                i=$(( $i + 1 ))
+            fi
+        done
+
+        if [ 0 == ${#files[@]} ]; then
+            suberror "Nothing to create a tarball from."
+            failed=true
+        else
+            create_tarball || failed=true
+        fi
+
+        cleanup $_password_names
+
+        if $failed; then
+            panic 1 "Failed to create a password tarball."
+        else
+            terminate "$(done_pws_message Export ${#files[@]})"
+        fi
+    }
+
+    do_import() {
+        rec_id=${__ARGUMENTS[1]%.*}
+        case $rec_id in
+            "" | "-h" | "--help")
+                import_usage
+                terminate "Help requested, nothing to do."
+                break ;;
+        esac
+
+        tarball=${__ARGUMENTS[1]}
+        if [ -z "$tarball" ]; then
+            panic 1 "Must provide a file to operate on."
+        fi
+
+        if [ ! -f "$tarball" ]; then
+            panic 127 "Specified file was not found."
+        fi
+
+        phase "Preparing"
+        check_recipient_pubk "$rec_id"
+        create_temp_dir
+
+        phase "Extracting"
+        $__GPG_PROG -r ${rec_id} --decrypt "${tarball}" 2>/dev/null \
+            | tar xp -C "$__TEMP_DIR"
+
+        _files=$(ls "$__TEMP_DIR")
+        _pw_files=()
+        _pw_names=()
+        i=0
+
+        for file in $_files; do
+            _pw_files[$i]="$__TEMP_DIR/$file"
+            _pw_names[$i]="${file%.*}"
+            i=$(( $i + 1 ))
+        done
+
+        phase "Inserting"
+        failed=false
+        amount=0
+        for j in $(seq 0 $(( $i - 1 ))); do
+            _pw="$($__GPG_PROG \
+                -r ${rec_id} \
+                --decrypt "${_pw_files[$j]}" 2>/dev/null)"
+            _name="${_pw_names[$j]}"
+
+            pass ${_name} 1>&- 2>&-
+            _check_ec=$?
+            _overwrite=true
+            case $_check_ec in
+                0)
+                    if confirm "Found \e[1m${_name}\e[0m locally. Overwrite?"
+                    then _overwrite=true
+                    else _overwrite=false; fi
+                    ;;
+                1)
+                    subaction "Inserting \e[1m${_name}\e[0m"
+                    _overwrite=true
+                    ;;
+                2)
+                    panic 1 "Failed to check for password"
+                    ;;
+            esac
+            if $_overwrite; then
+                printf "%s\n%s\n" "$_pw" "$_pw" \
+                    | pass insert "${_name}" -f 1>/dev/null 2>/dev/null \
+                    || failed=true
+                amount=$(( $amount + 1 ))
+            fi
+
+            $failed && break
+        done
+
+        phase "Cleaning up"
+        cleanup $_pw_files
+
+        if $failed; then
+            panic 1 "Couldn't import passwords."
+        else
+            terminate "$(done_pws_message Import $amount)"
+        fi
+    }
+
+    run_action() {
+        case $1 in
+            "import")
+                do_import
+                break ;;
+            "export")
+                do_export
+                break ;;
+            "" | "--help" | "-h")
+                usage
+                terminate "No action, nothing to do"
+                break ;;
+            *)
+                usage
+                panic 1 "Invalid action specified!"
+                break ;;
+        esac
+    }
+
+    main() {
+        dependencies
+        run_action ${__ARGUMENTS[0]}
+    }
+
+    # Entrypoint
+    main
+)
